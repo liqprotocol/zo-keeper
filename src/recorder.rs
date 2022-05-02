@@ -4,7 +4,10 @@ use anchor_client::{
         RpcAccountInfoConfig, RpcTransactionConfig, RpcTransactionLogsConfig,
         RpcTransactionLogsFilter,
     },
-    solana_sdk::{commitment_config::CommitmentConfig, signature::Signature},
+    solana_sdk::{
+        commitment_config::CommitmentConfig, pubkey::Pubkey,
+        signature::Signature,
+    },
 };
 use futures::{StreamExt, TryFutureExt};
 use jsonrpc_core_client::transports::ws;
@@ -17,7 +20,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime},
 };
-use tracing::{debug, info, trace, warn, Instrument};
+use tracing::{debug, error, info, trace, warn, Instrument};
 
 #[cfg(not(feature = "devnet"))]
 static DB_NAME: &str = "keeper";
@@ -33,15 +36,18 @@ pub async fn run(st: &'static AppState) -> Result<(), Error> {
     let db: &'static _ = Box::leak(Box::new(db));
 
     let listen_event_q_tasks =
-        st.load_dex_markets().map(|(symbol, dex_market)| {
-            listen_event_queue(st, db, symbol, dex_market)
-        });
+        st.load_dex_markets()?
+            .into_iter()
+            .map(|(symbol, dex_market)| {
+                listen_event_queue(st, db, symbol, dex_market)
+            });
 
     futures::join!(
         listen_logs(st, db),
         poll_logs(st, db),
         poll_update_funding(st, db),
         poll_open_interest(st, db),
+        poll_mark_twap(st, db),
         futures::future::join_all(listen_event_q_tasks),
     );
 
@@ -57,9 +63,11 @@ async fn listen_logs(st: &'static AppState, db: &'static mongodb::Database) {
         // On disconnect, retry every 5s.
         interval.tick().await;
 
-        let sub = ws::try_connect::<RpcSolPubSubClient>(st.cluster.ws_url())
-            .unwrap()
-            .await
+        let sub =
+            match ws::try_connect::<RpcSolPubSubClient>(st.cluster.ws_url()) {
+                Ok(x) => x.await,
+                Err(e) => Err(e),
+            }
             .and_then(|p| {
                 p.logs_subscribe(
                     RpcTransactionLogsFilter::Mentions(vec![
@@ -220,9 +228,11 @@ async fn listen_event_queue(
     let quote_decimals = 6u8;
 
     loop {
-        let sub = ws::try_connect::<RpcSolPubSubClient>(st.cluster.ws_url())
-            .unwrap()
-            .await
+        let sub =
+            match ws::try_connect::<RpcSolPubSubClient>(st.cluster.ws_url()) {
+                Ok(x) => x.await,
+                Err(e) => Err(e),
+            }
             .and_then(|p| {
                 p.account_subscribe(
                     event_q.clone(),
@@ -290,14 +300,24 @@ async fn poll_update_funding(
     // inserted into the DB if the funding time increases.
     let prev: HashMap<String, AtomicU64> = st
         .load_dex_markets()
+        .unwrap()
+        .into_iter()
         .map(|(s, _)| (s, AtomicU64::new(0)))
         .collect();
 
     loop {
         interval.tick().await;
 
-        let to_update: Vec<_> = st
-            .load_dex_markets()
+        let markets = match st.load_dex_markets() {
+            Ok(x) => x,
+            Err(e) => {
+                warn!("{}", Error::from(e));
+                continue;
+            }
+        };
+
+        let to_update: Vec<_> = markets
+            .into_iter()
             .filter(|(symbol, m)| {
                 let prev_update = prev
                     .get(symbol)
@@ -357,11 +377,10 @@ async fn poll_open_interest(
             .unwrap()
             .as_secs() as i64;
 
-        let val = tokio::task::spawn_blocking(move || {
+        let val: Result<_, Error> = tokio::task::spawn_blocking(move || {
             let mut r = vec![0i64; st.zo_state.total_markets as usize];
 
-            crate::utils::load_program_accounts::<zo_abi::Control>(&st.rpc)
-                .unwrap()
+            crate::utils::load_program_accounts::<zo_abi::Control>(&st.rpc)?
                 .into_iter()
                 .for_each(|(_, a)| {
                     for (i, e) in r.iter_mut().enumerate() {
@@ -372,12 +391,14 @@ async fn poll_open_interest(
                     }
                 });
 
-            st.iter_markets()
+            Ok(st
+                .iter_markets()
                 .enumerate()
                 .map(|(i, m)| (m.symbol.into(), r[i]))
-                .collect::<HashMap<String, i64>>()
+                .collect::<HashMap<String, i64>>())
         })
-        .await;
+        .await
+        .unwrap();
 
         let val = match val {
             Ok(x) => x,
@@ -391,5 +412,70 @@ async fn poll_open_interest(
             let e = Error::from(e);
             warn!("{}", e);
         }
+    }
+}
+
+#[tracing::instrument(skip_all, level = "error", name = "oracle_twap")]
+async fn poll_mark_twap(st: &'static AppState, db: &'static mongodb::Database) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+
+        let cache: Result<Result<zo_abi::Cache, _>, _> =
+            tokio::task::spawn_blocking(move || {
+                st.program().account(st.zo_cache_pubkey)
+            })
+            .await;
+
+        let cache = match cache {
+            Err(e) => {
+                error!("task panicked: {}", e);
+                continue;
+            }
+            Ok(x) => match x {
+                Err(e) => {
+                    warn!("{}", Error::from(e));
+                    continue;
+                }
+                Ok(x) => x,
+            },
+        };
+
+        let tasks = st
+            .zo_state
+            .perp_markets
+            .iter()
+            .zip(cache.marks.iter())
+            .filter(|(m, _)| m.dex_market != Pubkey::default())
+            .map(|(m, c)| {
+                use fixed::types::I80F48;
+
+                let adj =
+                    I80F48::from_num(10u64.pow((m.asset_decimals - 6) as u32));
+
+                let twap = adj
+                    * (I80F48::from(c.twap.open)
+                        + I80F48::from(c.twap.close)
+                        + I80F48::from(c.twap.high)
+                        + I80F48::from(c.twap.low))
+                    / I80F48::from_num(4);
+
+                db::MarkTwap {
+                    last_sample_start_time: c.twap.last_sample_start_time as i64,
+                    symbol: m.symbol.into(),
+                    twap: twap.to_num::<f64>(),
+                }
+            })
+            .map(|t| {
+                tokio::spawn(async move {
+                    if let Err(e) = db::MarkTwap::upsert(db, &t).await {
+                        warn!("{}", Error::from(e));
+                    }
+                })
+            });
+
+        futures::future::join_all(tasks).await;
     }
 }
